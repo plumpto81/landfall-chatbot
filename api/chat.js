@@ -93,30 +93,63 @@ module.exports = async (req, res) => {
 
     const system = buildSystem(pickChunks(history));
 
-    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + process.env.GROQ_API_KEY,
-      },
-      body: JSON.stringify({
-        model: process.env.CHAT_MODEL || "llama-3.3-70b-versatile",
+    // Groq retires models from time to time (llama-3.1-8b-instant and
+    // llama-3.3-70b-versatile were shut down on August 16, 2026). Try the configured
+    // model first, then fall back through the list. Set CHAT_MODEL in Vercel to
+    // change the first choice without touching code.
+    const models = [process.env.CHAT_MODEL, "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+      .filter(Boolean)
+      .filter((m, i, a) => a.indexOf(m) === i);
+
+    let lastStatus = 0;
+    for (const model of models) {
+      const payload = {
+        model,
         messages: [{ role: "system", content: system }, ...history],
         temperature: 0.2,
-        max_tokens: 450,
-      }),
-    });
+        max_tokens: 1200,
+      };
+      // gpt-oss models "think" before answering; keep that short so replies stay fast.
+      if (model.startsWith("openai/gpt-oss")) payload.reasoning_effort = "low";
 
-    const data = await r.json();
-    if (!r.ok) {
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + process.env.GROQ_API_KEY,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      let data = {};
+      try {
+        data = await r.json();
+      } catch (e) {}
+
+      if (r.ok) {
+        const reply =
+          (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+        if (reply.trim()) return res.status(200).json({ reply: reply.trim() });
+        console.error("Groq returned an empty reply for model " + model);
+        continue;
+      }
+
+      lastStatus = r.status;
+      console.error(
+        "Groq error " + r.status + " for model " + model + ": " + JSON.stringify((data && data.error) || data)
+      );
+
+      // A bad or missing key will fail for every model, so stop here.
+      if (r.status === 401 || r.status === 403) {
+        return res.status(502).json({ error: "The assistant is not set up correctly yet. Please try again later." });
+      }
       if (r.status === 429) {
         return res.status(429).json({ error: "The assistant is busy right now. Please try again in a moment." });
       }
-      return res.status(502).json({ error: "The assistant is unavailable right now. Please try again shortly." });
+      // Anything else (for example a retired model): try the next model.
     }
 
-    const reply = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
-    return res.status(200).json({ reply: reply.trim() });
+    return res.status(502).json({ error: "The assistant is unavailable right now. Please try again shortly." });
   } catch (err) {
     return res.status(500).json({ error: "Something went wrong. Please try again." });
   }
